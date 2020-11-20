@@ -1,6 +1,6 @@
 # Nomad Documentation Website
 
-This subdirectory contains the entire source for the [Nomad Website](https://nomadproject.io/). This is a [NextJS](https://nextjs.org/) project, which builds a static site from these source files.
+This subdirectory contains the entire source for the [Nomad Website](https://nomadproject.io/). This is a [NextJS](https://nextjs.org/) project, which builds a static site from these source files
 
 <!--
   This readme file contains several blocks of generated text, to make it easier to share common information
@@ -13,14 +13,28 @@ This subdirectory contains the entire source for the [Nomad Website](https://nom
 
 ## Table of Contents
 
-- [Contributions](#contributions-welcome)
-- [Running the Site Locally](#running-the-site-locally)
-- [Editing Markdown Content](#editing-markdown-content)
-- [Editing Navigation Sidebars](#editing-navigation-sidebars)
-- [Changing the Release Version](#changing-the-release-version)
-- [Redirects](#redirects)
-- [Browser Support](#browser-support)
-- [Deployment](#deployment)
+- [Nomad Documentation Website](#nomad-documentation-website)
+  - [Table of Contents](#table-of-contents)
+  - [Contributions Welcome!](#contributions-welcome)
+  - [Running the Site Locally](#running-the-site-locally)
+    - [With Docker](#with-docker)
+    - [With Node](#with-node)
+  - [Editing Markdown Content](#editing-markdown-content)
+    - [Creating New Pages](#creating-new-pages)
+    - [Markdown Enhancements](#markdown-enhancements)
+    - [Custom Components](#custom-components)
+      - [Tabs](#tabs)
+      - [Enterprise Alert](#enterprise-alert)
+      - [Other Components](#other-components)
+    - [Syntax Highlighting](#syntax-highlighting)
+  - [Editing Navigation Sidebars](#editing-navigation-sidebars)
+    - [Index-less Categories](#index-less-categories)
+    - [Custom or External Links](#custom-or-external-links)
+  - [Changing the Release Version](#changing-the-release-version)
+    - [Displaying a Prerelease](#displaying-a-prerelease)
+  - [Redirects](#redirects)
+  - [Browser Support](#browser-support)
+  - [Deployment](#deployment)
 
 <!-- BEGIN: contributions -->
 <!-- Generated text, do not edit directly -->
