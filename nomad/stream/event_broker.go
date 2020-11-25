@@ -18,6 +18,7 @@ import (
 const (
 	ACLCheckNodeRead   = "node-read"
 	ACLCheckManagement = "management"
+	aclCacheSize       = 32
 )
 
 type EventBrokerCfg struct {
@@ -40,6 +41,7 @@ type EventBroker struct {
 	publishCh chan *structs.Events
 
 	aclDelegate ACLDelegate
+	aclCache    *lru.TwoQueueCache
 
 	aclCh chan *structs.Event
 
@@ -50,7 +52,7 @@ type EventBroker struct {
 // A goroutine is run in the background to publish events to an event buffer.
 // Cancelling the context will shutdown the goroutine to free resources, and stop
 // all publishing.
-func NewEventBroker(ctx context.Context, aclDelegate ACLDelegate, cfg EventBrokerCfg) *EventBroker {
+func NewEventBroker(ctx context.Context, aclDelegate ACLDelegate, cfg EventBrokerCfg) (*EventBroker, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = hclog.NewNullLogger()
 	}
@@ -60,6 +62,11 @@ func NewEventBroker(ctx context.Context, aclDelegate ACLDelegate, cfg EventBroke
 		cfg.EventBufferSize = 100
 	}
 
+	aclCache, err := lru.New2Q(aclCacheSize)
+	if err != nil {
+		return nil, err
+	}
+
 	buffer := newEventBuffer(cfg.EventBufferSize)
 	e := &EventBroker{
 		logger:      cfg.Logger.Named("event_broker"),
@@ -67,6 +74,7 @@ func NewEventBroker(ctx context.Context, aclDelegate ACLDelegate, cfg EventBroke
 		publishCh:   make(chan *structs.Events, 64),
 		aclCh:       make(chan *structs.Event, 10),
 		aclDelegate: aclDelegate,
+		aclCache:    aclCache,
 		subscriptions: &subscriptions{
 			byToken: make(map[string]map[*SubscribeRequest]*Subscription),
 		},
@@ -75,7 +83,7 @@ func NewEventBroker(ctx context.Context, aclDelegate ACLDelegate, cfg EventBroke
 	go e.handleUpdates(ctx)
 	go e.handleACLUpdates(ctx)
 
-	return e
+	return e, nil
 }
 
 // Returns the current length of the event buffer
@@ -104,7 +112,7 @@ func (e *EventBroker) Publish(events *structs.Events) {
 // to ensure that the tokens privileges are sufficent enough.
 func (e *EventBroker) SubscribeWithACLCheck(req *SubscribeRequest) (*Subscription, error) {
 	if ok := e.aclForSubscriptionValid(req, req.Token); !ok {
-		return nil, ErrACLInvalid
+		return nil, structs.ErrPermissionDenied
 	}
 	return e.Subscribe(req)
 }
@@ -255,7 +263,7 @@ func (e *EventBroker) aclForSubscriptionValid(subReq *SubscribeRequest, secretID
 		}
 	}
 
-	aclObj, err := aclForTokenSecretID(tokenProvider, secretID)
+	aclObj, err := e.aclForTokenSecretID(tokenProvider, secretID)
 	if err != nil || aclObj == nil {
 		e.logger.Error("failed resolving ACL for secretID", "error", err)
 		return false
@@ -268,7 +276,7 @@ func (e *EventBroker) aclForSubscriptionValid(subReq *SubscribeRequest, secretID
 	return true
 }
 
-func aclForTokenSecretID(aclTokenProvider ACLTokenProvider, secretID string) (*acl.ACL, error) {
+func (e *EventBroker) aclForTokenSecretID(aclTokenProvider ACLTokenProvider, secretID string) (*acl.ACL, error) {
 	aclToken, err := aclTokenProvider.ACLTokenBySecretID(nil, secretID)
 	if err != nil {
 		return nil, err
@@ -288,11 +296,7 @@ func aclForTokenSecretID(aclTokenProvider ACLTokenProvider, secretID string) (*a
 		}
 		policies = append(policies, policy)
 	}
-	twoQueue, err := lru.New2Q(2)
-	if err != nil {
-		return nil, err
-	}
-	return structs.CompileACLObject(twoQueue, policies)
+	return structs.CompileACLObject(e.aclCache, policies)
 }
 
 func aclAllowsReq(policies map[string]struct{}, namespace string, aclObj *acl.ACL) bool {
