@@ -110,7 +110,7 @@ func (e *EventBroker) Publish(events *structs.Events) {
 }
 
 // SubscribeWithACLCheck validates the SubscribeRequest's token and requested Topics
-// to ensure that the tokens privileges are sufficent enough.
+// to ensure that the tokens privileges are sufficient enough.
 func (e *EventBroker) SubscribeWithACLCheck(req *SubscribeRequest) (*Subscription, error) {
 	aclObj, err := aclObjFromSnapshotForTokenSecretID(e.aclDelegate.TokenProvider(), e.aclCache, req.Token)
 	if err != nil {
