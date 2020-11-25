@@ -376,7 +376,14 @@ func TestEventBroker_handleACLUpdates_policyupdated(t *testing.T) {
 			require.NoError(t, err)
 
 			// Update the mock provider to use the after rules
-			tokenProvider.policy.Rules = tc.policyAfterRules
+			policyAfter := &structs.ACLPolicy{
+				Name:        "some-new-policy",
+				Rules:       tc.policyAfterRules,
+				ModifyIndex: 101, // The ModifyIndex is used to caclulate the acl cache key
+			}
+			policyAfter.SetHash()
+
+			tokenProvider.policy = policyAfter
 
 			aclEvent := structs.Event{
 				Topic: structs.TopicACLToken,
@@ -401,8 +408,12 @@ func TestEventBroker_handleACLUpdates_policyupdated(t *testing.T) {
 				for {
 					_, err = sub.Next(ctx)
 					if err != nil {
-						require.Equal(t, ErrSubscriptionClosed, err)
-						break
+						if err == context.DeadlineExceeded {
+							require.Fail(t, err.Error())
+						}
+						if err == ErrSubscriptionClosed {
+							break
+						}
 					}
 				}
 			} else {
