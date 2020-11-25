@@ -210,22 +210,9 @@ func (e *EventBroker) handleACLUpdates(ctx context.Context) {
 					continue
 				}
 
-				e.mu.Lock()
-				defer e.mu.Unlock()
-
-				if subs, ok := e.subscriptions.byToken[tokenSecretID]; ok {
-					for _, sub := range subs {
-						// should this sub even be stored if it's invalid?
-						// TODO sentinel value of topics should be *:*
-						if len(sub.req.Topics) == 0 {
-							continue
-						}
-
-						if allowed := aclAllowsSubscription(aclObj, sub.req); !allowed {
-							sub.forceClose()
-						}
-					}
-				}
+				e.subscriptions.closeSubscriptionFunc(tokenSecretID, func(sub *Subscription) bool {
+					return !aclAllowsSubscription(aclObj, sub.req)
+				})
 
 				// if err := e.ACLValidForReq()
 				// Token was updated
@@ -367,6 +354,17 @@ func (s *subscriptions) closeSubscriptionsForTokens(tokenSecretIDs []string) {
 			for _, sub := range subs {
 				sub.forceClose()
 			}
+		}
+	}
+}
+
+func (s *subscriptions) closeSubscriptionFunc(tokenSecretID string, fn func(*Subscription) bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, sub := range s.byToken[tokenSecretID] {
+		if fn(sub) {
+			sub.forceClose()
 		}
 	}
 }
