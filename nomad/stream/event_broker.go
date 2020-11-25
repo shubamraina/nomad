@@ -2,6 +2,7 @@ package stream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -111,9 +112,15 @@ func (e *EventBroker) Publish(events *structs.Events) {
 // SubscribeWithACLCheck validates the SubscribeRequest's token and requested Topics
 // to ensure that the tokens privileges are sufficent enough.
 func (e *EventBroker) SubscribeWithACLCheck(req *SubscribeRequest) (*Subscription, error) {
-	if ok := e.aclForSubscriptionValid(req, req.Token); !ok {
+	aclObj, err := aclObjFromSnapshotForTokenSecretID(e.aclDelegate.TokenProvider(), e.aclCache, req.Token)
+	if err != nil {
 		return nil, structs.ErrPermissionDenied
 	}
+
+	if allowed := aclAllowsSubscription(aclObj, req); !allowed {
+		return nil, structs.ErrPermissionDenied
+	}
+
 	return e.Subscribe(req)
 }
 
@@ -183,15 +190,41 @@ func (e *EventBroker) handleACLUpdates(ctx context.Context) {
 		case update := <-e.aclCh:
 			switch payload := update.Payload.(type) {
 			case structs.ACLTokenEvent:
+				tokenSecretID := payload.ACLToken.SecretID
+
 				// Token was deleted
 				if update.Type == structs.TypeACLTokenDeleted {
-					e.subscriptions.closeSubscriptionsForTokens([]string{payload.ACLToken.SecretID})
+					e.subscriptions.closeSubscriptionsForTokens([]string{tokenSecretID})
 					continue
 				}
 
-				if e.aclDelegate != nil {
-					aclTokenProvider := e.aclDelegate.TokenProvider()
-					e.closeInvalidSubscriptions(aclTokenProvider, payload.ACLToken.SecretID)
+				if e.aclDelegate == nil {
+					// nothing more to do
+					continue
+				}
+
+				aclObj, err := aclObjFromSnapshotForTokenSecretID(e.aclDelegate.TokenProvider(), e.aclCache, tokenSecretID)
+				if err != nil || aclObj == nil {
+					e.logger.Error("failed resolving ACL for secretID, closing subscriptions", "error", err)
+					e.subscriptions.closeSubscriptionsForTokens([]string{tokenSecretID})
+					continue
+				}
+
+				e.mu.Lock()
+				defer e.mu.Unlock()
+
+				if subs, ok := e.subscriptions.byToken[tokenSecretID]; ok {
+					for _, sub := range subs {
+						// should this sub even be stored if it's invalid?
+						// TODO sentinel value of topics should be *:*
+						if len(sub.req.Topics) == 0 {
+							continue
+						}
+
+						if allowed := aclAllowsSubscription(aclObj, sub.req); !allowed {
+							sub.forceClose()
+						}
+					}
 				}
 
 				// if err := e.ACLValidForReq()
@@ -211,6 +244,33 @@ func (e *EventBroker) handleACLUpdates(ctx context.Context) {
 	}
 }
 
+func aclObjFromSnapshotForTokenSecretID(aclSnapshot ACLTokenProvider, aclCache *lru.TwoQueueCache, tokenSecretID string) (*acl.ACL, error) {
+	aclToken, err := aclSnapshot.ACLTokenBySecretID(nil, tokenSecretID)
+	if err != nil {
+		return nil, err
+	}
+
+	if aclToken == nil {
+		return nil, errors.New("no token for secret ID")
+	}
+
+	aclPolicies := make([]*structs.ACLPolicy, 0, len(aclToken.Policies))
+	for _, policyName := range aclToken.Policies {
+		policy, err := aclSnapshot.ACLPolicyByName(nil, policyName)
+		if err != nil || policy == nil {
+			return nil, errors.New("error finding acl policy")
+		}
+		aclPolicies = append(aclPolicies, policy)
+	}
+
+	return structs.CompileACLObject(aclCache, aclPolicies)
+}
+
+type thingy struct {
+	snapshot ACLTokenProvider
+	secretID string
+}
+
 type ACLTokenProvider interface {
 	ACLTokenBySecretID(ws memdb.WatchSet, secretID string) (*structs.ACLToken, error)
 	ACLPolicyByName(ws memdb.WatchSet, policyName string) (*structs.ACLPolicy, error)
@@ -220,64 +280,32 @@ type ACLDelegate interface {
 	TokenProvider() ACLTokenProvider
 }
 
-func (e *EventBroker) closeInvalidSubscriptions(aclTokenProvider ACLTokenProvider, secretID string) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if subs, ok := e.subscriptions.byToken[secretID]; ok {
-		for _, sub := range subs {
-			// should this sub even be stored if it's invalid?
-			// TODO sentinel value of topics should be *:*
-			if len(sub.req.Topics) == 0 {
-				continue
-			}
-
-			if ok := e.aclForSubscriptionValid(sub.req, secretID); !ok {
-				e.logger.Debug("closing subscription for secretID which is no longer valid")
-				sub.forceClose()
-			}
-		}
-	}
-}
-
-func (e *EventBroker) aclForSubscriptionValid(subReq *SubscribeRequest, secretID string) bool {
-	tokenProvider := e.aclDelegate.TokenProvider()
-	policies := make(map[string]struct{})
-	var required = struct{}{}
-
+func aclAllowsSubscription(aclObj *acl.ACL, subReq *SubscribeRequest) bool {
 	for topic := range subReq.Topics {
 		switch topic {
 		case structs.TopicDeployment,
 			structs.TopicEval,
 			structs.TopicAlloc,
 			structs.TopicJob:
-			policies[acl.NamespaceCapabilityReadJob] = required
+			if ok := aclObj.AllowNsOp(subReq.Namespace, acl.NamespaceCapabilityReadJob); !ok {
+				return false
+			}
 		case structs.TopicNode:
-			policies[ACLCheckNodeRead] = required
-		case structs.TopicAll:
-			policies[ACLCheckManagement] = required
+			if ok := aclObj.AllowNodeRead(); !ok {
+				return false
+			}
 		default:
-			// If the requested topic is unknown require management to be extra
-			// cautious
-			policies[ACLCheckManagement] = required
+			if ok := aclObj.IsManagement(); !ok {
+				return false
+			}
 		}
 	}
 
-	aclObj, err := e.aclForTokenSecretID(tokenProvider, secretID)
-	if err != nil || aclObj == nil {
-		e.logger.Error("failed resolving ACL for secretID", "error", err)
-		return false
-	}
-
-	// run the check
-	if allowed := aclAllowsReq(policies, subReq.Namespace, aclObj); !allowed {
-		return false
-	}
 	return true
 }
 
-func (e *EventBroker) aclForTokenSecretID(aclTokenProvider ACLTokenProvider, secretID string) (*acl.ACL, error) {
-	aclToken, err := aclTokenProvider.ACLTokenBySecretID(nil, secretID)
+func aclForTokenSecretID(thingy thingy, aclCache *lru.TwoQueueCache) (*acl.ACL, error) {
+	aclToken, err := thingy.snapshot.ACLTokenBySecretID(nil, thingy.secretID)
 	if err != nil {
 		return nil, err
 	}
@@ -287,7 +315,7 @@ func (e *EventBroker) aclForTokenSecretID(aclTokenProvider ACLTokenProvider, sec
 
 	policies := make([]*structs.ACLPolicy, 0, len(aclToken.Policies))
 	for _, policyName := range aclToken.Policies {
-		policy, err := aclTokenProvider.ACLPolicyByName(nil, policyName)
+		policy, err := thingy.snapshot.ACLPolicyByName(nil, policyName)
 		if err != nil {
 			return nil, err
 		}
@@ -296,28 +324,7 @@ func (e *EventBroker) aclForTokenSecretID(aclTokenProvider ACLTokenProvider, sec
 		}
 		policies = append(policies, policy)
 	}
-	return structs.CompileACLObject(e.aclCache, policies)
-}
-
-func aclAllowsReq(policies map[string]struct{}, namespace string, aclObj *acl.ACL) bool {
-	for policy := range policies {
-		switch policy {
-		case acl.NamespaceCapabilityReadJob:
-			if ok := aclObj.AllowNsOp(namespace, acl.NamespaceCapabilityReadJob); !ok {
-				return false
-			}
-		case "node-read":
-			if ok := aclObj.AllowNodeRead(); !ok {
-				return false
-			}
-		case "management":
-			if ok := aclObj.IsManagement(); !ok {
-				return false
-			}
-		}
-	}
-
-	return true
+	return structs.CompileACLObject(aclCache, policies)
 }
 
 func (s *Subscription) forceClose() {
